@@ -37,9 +37,15 @@ export interface PreparedCodexHistory {
   readonly turnInput: readonly (CodexTextInput | CodexImageInput)[]
 }
 
-function replayState(value: unknown): CodexReplayState | undefined {
+export function codexReplayState(value: unknown): CodexReplayState | undefined {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const candidate = value as Record<string, unknown>
+  const envelope = value as Record<string, unknown>
+  // DSH 0.1.1 stores adapter-private replay data inside ReplayEnvelope.response.
+  // Accept the earlier direct payload as a migration path for sessions created
+  // by codex-plugin-dsh on DSH 0.1.0.
+  const raw = 'response' in envelope ? envelope.response : envelope
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const candidate = raw as Record<string, unknown>
   if (candidate.kind !== 'codex-app-server' || candidate.version !== 1) return undefined
   if (typeof candidate.threadId !== 'string' || candidate.threadId.length === 0) return undefined
   if (typeof candidate.turnId !== 'string' || candidate.turnId.length === 0) return undefined
@@ -63,7 +69,7 @@ function latestCheckpoint(
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index]
     if (message?.role !== 'assistant' || message.source.kind !== 'model' || message.source.provider !== provider) continue
-    const state = replayState(message.source.replayState)
+    const state = codexReplayState(message.source.replayState)
     if (state === undefined) {
       if (message.content.some(block => block.type === 'tool-call')) continue
       throw new Error(
@@ -88,7 +94,57 @@ function isCurrentTurnInput(message: Message): boolean {
   return message.role === 'user'
     && message.source.kind !== 'tool'
     && message.content.length > 0
-    && message.content.every(block => block.type === 'text' || block.type === 'image')
+}
+
+function inertToolCallText(block: Extract<ContentBlock, { type: 'tool-call' }>): string {
+  const argumentsText = block.arguments.trim()
+  const header = `[DSH tool call ${JSON.stringify(block.name)} copied as context; not executed in this thread]`
+  return argumentsText === '' ? header : `${header}\n${argumentsText}`
+}
+
+async function normalizedInputContent(
+  blocks: readonly ContentBlock[],
+  label: string,
+  resolveImageUrl: CodexImageUrlResolver,
+): Promise<(CodexTextInput | CodexImageInput)[]> {
+  const content: (CodexTextInput | CodexImageInput)[] = []
+  for (const block of blocks) {
+    switch (block.type) {
+      case 'text':
+        content.push({ type: 'text', text: block.text, text_elements: [] })
+        break
+      case 'image':
+        content.push({ type: 'image', url: await resolveImageUrl(block.attachment) })
+        break
+      case 'reasoning':
+        content.push({
+          type: 'text',
+          text: `[DSH reasoning summary copied as context]\n${block.text}`,
+          text_elements: [],
+        })
+        break
+      case 'tool-call':
+        content.push({ type: 'text', text: inertToolCallText(block), text_elements: [] })
+        break
+      case 'tool-result':
+        content.push({
+          type: 'text',
+          text: `[DSH embedded tool result for ${JSON.stringify(block.toolCallId)}${block.isError === true ? '; error' : ''}]`,
+          text_elements: [],
+        })
+        content.push(...await normalizedInputContent(
+          block.content,
+          `${label} embedded tool result ${JSON.stringify(block.toolCallId)}`,
+          resolveImageUrl,
+        ))
+        break
+      default:
+        throw new Error(
+          `codex-plugin-dsh: ${label} contains a plugin-defined content block that App Server cannot import`,
+        )
+    }
+  }
+  return content
 }
 
 async function inputContent(
@@ -96,13 +152,9 @@ async function inputContent(
   label: string,
   resolveImageUrl: CodexImageUrlResolver,
 ): Promise<Record<string, unknown>[]> {
-  return Promise.all(blocks.map(async (block) => {
-    if (block.type === 'text') return { type: 'input_text', text: block.text }
-    if (block.type === 'image') {
-      return { type: 'input_image', image_url: await resolveImageUrl(block.attachment) }
-    }
-    throw new Error(`codex-plugin-dsh: ${label} contains unsupported ${JSON.stringify(block.type)} content`)
-  }))
+  return (await normalizedInputContent(blocks, label, resolveImageUrl)).map(input => input.type === 'text'
+    ? { type: 'input_text', text: input.text }
+    : { type: 'input_image', image_url: input.url })
 }
 
 async function toolOutput(
@@ -162,9 +214,14 @@ function assistantHistoryItems(message: Message): Record<string, unknown>[] {
         })
         break
       case 'reasoning':
-        throw new Error(
-          'codex-plugin-dsh: another provider\'s reasoning history cannot be imported into Codex App Server; start a new session',
-        )
+        // Reasoning summaries are intentionally not re-imported into a rebuilt
+        // App Server thread. The Responses backend cannot accept client-injected
+        // reasoning items (it requires server-generated encrypted content and
+        // rejects unpersisted items), and the summaries remain available in the
+        // DSH session log. The assistant's text and tool history below carries
+        // the substantive context, so the continuation stays lossless where it
+        // matters to the model.
+        break
       case 'image':
       case 'tool-result':
         throw new Error(`codex-plugin-dsh: assistant history contains unsupported ${JSON.stringify(block.type)} content`)
@@ -194,6 +251,8 @@ export async function responseItems(
  * @param messages - Exact DSH provider message sequence for this request.
  * @param provider - Registered Codex provider route.
  * @param ignoreCheckpoint - Rebuild from DSH history instead of reusing a persisted Codex thread.
+ * @param sessionId - Exact live DSH session identity; a checkpoint from a forked
+ *   or copied session is rebuilt instead of reusing the parent App Server thread.
  * @returns Work required to construct the matching App Server thread.
  */
 export async function prepareCodexHistory(
@@ -201,8 +260,12 @@ export async function prepareCodexHistory(
   provider: string,
   resolveImageUrl: CodexImageUrlResolver,
   ignoreCheckpoint = false,
+  sessionId?: string,
 ): Promise<PreparedCodexHistory> {
-  const checkpoint = ignoreCheckpoint ? undefined : latestCheckpoint(messages, provider)
+  const candidate = ignoreCheckpoint ? undefined : latestCheckpoint(messages, provider)
+  const checkpoint = candidate !== undefined && (sessionId === undefined || candidate.state.sessionId === sessionId)
+    ? candidate
+    : undefined
   const pending = checkpoint === undefined ? messages : messages.slice(checkpoint.index + 1)
   let inputStart = pending.length
   while (inputStart > 0 && isCurrentTurnInput(pending[inputStart - 1] as Message)) inputStart -= 1
@@ -211,17 +274,8 @@ export async function prepareCodexHistory(
   if (current.length === 0) {
     throw new Error('codex-plugin-dsh: the current Codex turn has no user input')
   }
-  const turnInput = (await Promise.all(current.map(message => Promise.all(message.content.map(async (block) => {
-    if (block.type === 'text') {
-      return { type: 'text' as const, text: block.text, text_elements: [] as const }
-    }
-    if (block.type === 'image') {
-      return { type: 'image' as const, url: await resolveImageUrl(block.attachment) }
-    }
-    throw new Error(
-      `codex-plugin-dsh: current user input contains unsupported ${JSON.stringify(block.type)} content`,
-    )
-  }))))).flat()
+  const turnInput = (await Promise.all(current.map(message =>
+    normalizedInputContent(message.content, 'current user input', resolveImageUrl)))).flat()
   if (turnInput.every(input => input.type === 'text' && input.text.trim().length === 0)) {
     throw new Error('codex-plugin-dsh: the current Codex turn is empty')
   }

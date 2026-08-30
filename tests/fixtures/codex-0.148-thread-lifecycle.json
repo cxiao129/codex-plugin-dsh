@@ -1,0 +1,30 @@
+{
+  "codexCliVersion": "0.148.0",
+  "generatedBy": "codex app-server generate-json-schema",
+  "methods": {
+    "thread/read": {
+      "params": ["threadId", "includeTurns"],
+      "response": ["thread"]
+    },
+    "thread/resume": {
+      "params": ["threadId"],
+      "response": ["thread"]
+    },
+    "thread/fork": {
+      "params": ["threadId", "lastTurnId"],
+      "response": ["thread"]
+    },
+    "thread/archive": {
+      "params": ["threadId"],
+      "response": []
+    },
+    "thread/unarchive": {
+      "params": ["threadId"],
+      "response": ["thread"]
+    },
+    "thread/delete": {
+      "params": ["threadId"],
+      "response": []
+    }
+  }
+}
