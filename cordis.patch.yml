@@ -1,4 +1,13 @@
 # Mount the host plugin in any DSH profile that installs this bundle.
+# gpt-5.6-sol reports a 1,048,576-token combined context. Publishing that
+# capacity before the first turn lets DSH compact instead of requesting an
+# oversized App Server call.
 - insert:
     - id: codex-app-server-provider
       name: codex-plugin-dsh
+      config:
+        # Long local reasoning and transient network stalls can exceed ten
+        # minutes without being abandoned; this remains an inactivity deadline.
+        turnTimeoutMs: 3600000
+        modelContextWindows:
+          gpt-5.6-sol: 1048576

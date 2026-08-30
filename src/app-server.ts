@@ -71,15 +71,27 @@ export class CodexAppServerConnection {
   private readonly transport: JsonRpcLineTransport
   private readonly queue = new NotificationQueue()
   private closing = false
+  private failureReported = false
+
+  private readonly onStdinError = (error: Error): void => {
+    // JsonRpcLineTransport may finish an already-running inbound request after
+    // close() ended the child stdin. Node emits ERR_STREAM_WRITE_AFTER_END on
+    // that caller-owned stream; during teardown it is expected and must not
+    // escape as an unhandled process-level error.
+    if (this.closing) return
+    this.reportFailure(thrown(error))
+  }
 
   constructor(
     private readonly child: SubprocessHandle,
     requestHandler: AppServerRequestHandler,
     private readonly observer?: AppServerConnectionObserver,
+    private readonly closeTimeoutMs = 10_000,
   ) {
     if (child.stdout === undefined || child.stdin === undefined) {
       throw new Error('codex-plugin-dsh: App Server subprocess requires piped stdin and stdout')
     }
+    child.stdin.on('error', this.onStdinError)
     this.transport = new JsonRpcLineTransport(child.stdout, child.stdin)
     this.transport.onRequest(requestHandler)
     this.transport.onNotification((method, params) => {
@@ -89,18 +101,12 @@ export class CodexAppServerConnection {
     })
     void child.done.then(
       outcome => {
-        if (this.closing) return
-        const error = new Error(
+        this.reportFailure(new Error(
           `codex-plugin-dsh: App Server exited unexpectedly (code ${String(outcome.exitCode)}, signal ${String(outcome.signal)})${this.stderrSuffix()}`,
-        )
-        if (this.observer === undefined) this.queue.fail(error)
-        else this.observer.failure(error)
+        ))
       },
       error => {
-        if (this.closing) return
-        const failure = thrown(error)
-        if (this.observer === undefined) this.queue.fail(failure)
-        else this.observer.failure(failure)
+        this.reportFailure(thrown(error))
       },
     )
   }
@@ -151,8 +157,15 @@ export class CodexAppServerConnection {
       // Concurrent process closure leaves tree termination below authoritative.
     }
     this.child.terminate()
-    await this.child.waitForExit()
-    await this.child.done.catch(() => {})
+    const exited = await this.child.waitForExit(AbortSignal.timeout(this.closeTimeoutMs))
+    if (exited) await this.child.done.catch(() => {})
+  }
+
+  private reportFailure(error: Error): void {
+    if (this.closing || this.failureReported) return
+    this.failureReported = true
+    if (this.observer === undefined) this.queue.fail(error)
+    else this.observer.failure(error)
   }
 
   private stderrSuffix(): string {

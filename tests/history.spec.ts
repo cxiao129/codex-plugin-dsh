@@ -31,6 +31,27 @@ function user(text: string): Message {
   return createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
 }
 
+function settledWithToolCall(): Message {
+  return createUserMessage({
+    content: [
+      { type: 'text', text: 'Background subagent child-1 failed before it finished.' },
+      { type: 'text', text: 'Its closing message:' },
+      {
+        type: 'tool-call',
+        id: CallId('child-call'),
+        name: 'grep',
+        arguments: '{"pattern":"x"}',
+      },
+    ],
+    source: {
+      kind: 'subagent-settled',
+      form: 'notice',
+      summary: 'Background subagent child-1 failed before it finished.',
+      senderSessionId: 'child-1',
+    } as never,
+  })
+}
+
 function checkpoint(threadId = 'thread-1', turnId = 'turn-1'): CodexReplayState {
   return {
     kind: 'codex-app-server',
@@ -70,11 +91,57 @@ describe('prepareCodexHistory', () => {
     })
   })
 
+  it('projects a current subagent settlement tool call as inert text', async () => {
+    await expect(prepareCodexHistory(
+      [settledWithToolCall()],
+      provider,
+      resolveImageUrl,
+    )).resolves.toEqual({
+      injectItems: [],
+      turnInput: [
+        {
+          type: 'text',
+          text: 'Background subagent child-1 failed before it finished.',
+          text_elements: [],
+        },
+        { type: 'text', text: 'Its closing message:', text_elements: [] },
+        {
+          type: 'text',
+          text: '[DSH tool call "grep" copied as context; not executed in this thread]\n{"pattern":"x"}',
+          text_elements: [],
+        },
+      ],
+    })
+  })
+
+  it('projects a historical subagent settlement tool call as inert input text', async () => {
+    await expect(responseItems(
+      [settledWithToolCall()],
+      resolveImageUrl,
+    )).resolves.toEqual([
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Background subagent child-1 failed before it finished.',
+          },
+          { type: 'input_text', text: 'Its closing message:' },
+          {
+            type: 'input_text',
+            text: '[DSH tool call "grep" copied as context; not executed in this thread]\n{"pattern":"x"}',
+          },
+        ],
+      },
+    ])
+  })
+
   it('pins the newest compatible Codex checkpoint', async () => {
     const state = checkpoint()
     const assistant = createAssistantMessage({
       content: [{ type: 'text', text: 'prior answer' }],
-      source: { provider, model: 'gpt-test', replayState: state },
+      source: { provider, model: 'gpt-test', replayState: { response: state } },
     })
     await expect(prepareCodexHistory(
       [user('old'), assistant, user('next')],
@@ -83,6 +150,33 @@ describe('prepareCodexHistory', () => {
     )).resolves.toEqual({
       checkpoint: state,
       injectItems: [],
+      turnInput: [{ type: 'text', text: 'next', text_elements: [] }],
+    })
+  })
+
+  it('rebuilds rather than reusing a checkpoint owned by another DSH session', async () => {
+    const state = checkpoint()
+    const assistant = createAssistantMessage({
+      content: [{ type: 'text', text: 'prior answer' }],
+      source: { provider, model: 'gpt-test', replayState: { response: state } },
+    })
+
+    await expect(prepareCodexHistory(
+      [user('old'), assistant, user('next')],
+      provider,
+      resolveImageUrl,
+      false,
+      'session-2',
+    )).resolves.toEqual({
+      injectItems: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'old' }] },
+        {
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'prior answer', annotations: [] }],
+        },
+      ],
       turnInput: [{ type: 'text', text: 'next', text_elements: [] }],
     })
   })
@@ -239,12 +333,49 @@ describe('prepareCodexHistory', () => {
     ])
   })
 
-  it('fails instead of silently dropping foreign reasoning history', async () => {
+  it('skips reasoning blocks while importing surrounding assistant history', async () => {
+    const foreign = createAssistantMessage({
+      content: [
+        { type: 'reasoning', text: 'private chain' },
+        { type: 'text', text: 'thinking about it' },
+        { type: 'text', text: 'answer' },
+      ],
+      source: { provider: 'deepseek', model: 'deepseek-reasoner' },
+    })
+    await expect(responseItems([foreign], resolveImageUrl)).resolves.toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [
+          { type: 'output_text', text: 'thinking about it', annotations: [] },
+          { type: 'output_text', text: 'answer', annotations: [] },
+        ],
+      },
+    ])
+  })
+
+  it('continues a foreign-provider session instead of failing on reasoning history', async () => {
     const foreign = createAssistantMessage({
       content: [{ type: 'reasoning', text: 'private chain' }, { type: 'text', text: 'answer' }],
       source: { provider: 'deepseek', model: 'deepseek-reasoner' },
     })
-    await expect(responseItems([foreign], resolveImageUrl)).rejects.toThrow('reasoning history cannot be imported')
+    await expect(prepareCodexHistory(
+      [user('old'), foreign, user('continue')],
+      provider,
+      resolveImageUrl,
+    )).resolves.toEqual({
+      injectItems: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'old' }] },
+        {
+          type: 'message',
+          role: 'assistant',
+          status: 'completed',
+          content: [{ type: 'output_text', text: 'answer', annotations: [] }],
+        },
+      ],
+      turnInput: [{ type: 'text', text: 'continue', text_elements: [] }],
+    })
   })
 
   it('fails when an older Codex response cannot identify its App Server thread', async () => {
